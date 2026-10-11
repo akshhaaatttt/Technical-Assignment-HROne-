@@ -38,7 +38,7 @@ from bson import json_util
 from dotenv import load_dotenv
 from fastapi import Body, FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from pymongo import ASCENDING, DESCENDING, IndexModel, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 # --------------------------------------------------------------------------- #
@@ -209,12 +209,29 @@ def working_days_in_month(month: str, joined_on: str) -> int:
     return count_weekdays(start, calendar_date.fromisoformat(last))
 
 
+def validation_error(message: str, *location: str) -> HTTPException:
+    """A 422 in the shape the contract documents.
+
+    Every 422 in openapi.yaml references ValidationError, whose `detail` is an
+    array of objects, while 404/409/503 reference Error, whose `detail` is a
+    string. Pydantic produces the array shape for free; the rules that cannot be
+    expressed as a field constraint - a date range the wrong way round, a
+    correction that changes nothing - have to build it, so that one status code
+    never has two different body shapes.
+    """
+    return HTTPException(422, detail=[{
+        "type": "value_error",
+        "loc": list(location),
+        "msg": message,
+    }])
+
+
 def parse_calendar_date(value: str, field: str) -> calendar_date:
     """YYYY-MM-DD -> date. Well-formed but impossible dates (2026-02-30) are 422."""
     try:
         return calendar_date.fromisoformat(value)
     except ValueError:
-        raise HTTPException(422, f"{field} is not a valid calendar date")
+        raise validation_error(f"{field} is not a valid calendar date", field)
 
 
 def bson_to_json(doc: Any) -> Any:
@@ -301,16 +318,23 @@ IX_ATT_EMP_DATE = {"emp_code": 1, "date": 1}
 IX_ATT_DATE_EMP = {"date": -1, "emp_code": 1}
 IX_ATT_EMP_PUNCH_IN = {"emp_code": 1, "punch_in": -1}
 
-INDEX_SPECS: tuple[tuple[Any, dict, dict], ...] = (
-    # employees
-    (employees, IX_EMP_CODE, {"name": "uq_emp_code", "unique": True}),
-    (employees, IX_EMP_DEPT_CODE, {"name": "dept_emp_code"}),
-    (employees, IX_EMP_DEPT_JOINED, {"name": "dept_joined_on"}),
-    (employees, IX_EMP_JOINED, {"name": "joined_on"}),
-    # attendance_logs
-    (attendance, IX_ATT_EMP_DATE, {"name": "uq_emp_code_date", "unique": True}),
-    (attendance, IX_ATT_DATE_EMP, {"name": "date_emp_code"}),
-    (attendance, IX_ATT_EMP_PUNCH_IN, {"name": "emp_code_punch_in"}),
+# Grouped per collection on purpose: one createIndexes command builds every
+# index for a collection in a single pass over the documents. Creating them one
+# at a time rescans the collection per index, which on 100k attendance records
+# is the difference between a couple of seconds and most of the 20-second
+# startup budget.
+INDEX_SPECS: tuple[tuple[Any, tuple[tuple[dict, dict], ...]], ...] = (
+    (employees, (
+        (IX_EMP_CODE, {"name": "uq_emp_code", "unique": True}),
+        (IX_EMP_DEPT_CODE, {"name": "dept_emp_code"}),
+        (IX_EMP_DEPT_JOINED, {"name": "dept_joined_on"}),
+        (IX_EMP_JOINED, {"name": "joined_on"}),
+    )),
+    (attendance, (
+        (IX_ATT_EMP_DATE, {"name": "uq_emp_code_date", "unique": True}),
+        (IX_ATT_DATE_EMP, {"name": "date_emp_code"}),
+        (IX_ATT_EMP_PUNCH_IN, {"name": "emp_code_punch_in"}),
+    )),
 )
 
 _indexes_ready = False
@@ -343,20 +367,33 @@ def _create_index(collection: Any, keys: dict, options: dict) -> bool:
 
 
 def ensure_indexes() -> bool:
-    """Create every index this app needs. Each one is attempted independently, so
-    a single failure cannot leave the rest missing, and nothing here raises: the
-    process must start, and /health retries until the database cooperates."""
+    """Create every index this app needs, idempotently.
+
+    One batched command per collection for speed; if the batch is rejected (one
+    bad spec fails the whole command) fall back to creating them individually,
+    so a single failure cannot leave the others missing. Nothing here raises:
+    the process must start, and /health retries until the database cooperates.
+    """
     global _indexes_ready
     with _index_lock:
         if _indexes_ready:
             return True
-        created = [_create_index(*spec) for spec in INDEX_SPECS]
-        _indexes_ready = all(created)
+        results = []
+        for collection, specs in INDEX_SPECS:
+            try:
+                collection.create_indexes(
+                    [IndexModel(list(keys.items()), **options) for keys, options in specs]
+                )
+                results.append(True)
+            except PyMongoError as exc:
+                LOG.warning("batched index creation on %s failed (%s); creating one by one",
+                            collection.name, exc)
+                results += [_create_index(collection, keys, options) for keys, options in specs]
+        _indexes_ready = all(results)
         if _indexes_ready:
             LOG.info("indexes ready on %s", MONGO_DB)
         else:
-            LOG.warning("%d of %d indexes are missing, will retry",
-                        created.count(False), len(created))
+            LOG.warning("%d index group(s) incomplete, will retry", results.count(False))
         return _indexes_ready
 
 
@@ -484,7 +521,7 @@ def build_attendance_query(
     if date_to is not None:
         parse_calendar_date(date_to, "date_to")
     if date_from is not None and date_to is not None and date_from > date_to:
-        raise HTTPException(422, "date_from must not be after date_to")
+        raise validation_error("date_from must not be after date_to", "query", "date_from")
 
     query: dict = {}
     if emp_code is not None:
@@ -713,9 +750,10 @@ def validate_trend_range(date_from: str, date_to: str) -> None:
     start = parse_calendar_date(date_from, "from")
     end = parse_calendar_date(date_to, "to")
     if end < start:
-        raise HTTPException(422, "to must not be before from")
+        raise validation_error("to must not be before from", "query", "to")
     if (end - start).days + 1 > TREND_MAX_DAYS:
-        raise HTTPException(422, f"the range must not exceed {TREND_MAX_DAYS} days")
+        raise validation_error(f"the range must not exceed {TREND_MAX_DAYS} days",
+                               "query", "to")
 
 
 # --------------------------------------------------------------------------- #
@@ -824,9 +862,10 @@ def punch_out(body: PunchOutIn):
 
     opened_at = record["punch_in"]
     if punched_at <= opened_at:
-        raise HTTPException(422, "punched_at must be after punch_in")
+        raise validation_error("punched_at must be after punch_in", "body", "punched_at")
     if punched_at - opened_at > timedelta(hours=24):
-        raise HTTPException(422, "punched_at must be within 24 hours of punch_in")
+        raise validation_error("punched_at must be within 24 hours of punch_in",
+                               "body", "punched_at")
 
     work_hours = compute_work_hours(opened_at, punched_at)
     # punch_out: None in the filter is the real guard: two simultaneous
@@ -895,22 +934,27 @@ def regularize_attendance(
     is_presence = status in PRESENCE_STATUSES
 
     if not is_presence and ("punch_in" in sent or "punch_out" in sent):
-        raise HTTPException(422, f"{status} clears the punch times; do not send them")
+        raise validation_error(f"{status} clears the punch times; do not send them",
+                               "body", "status")
 
     if is_presence:
         new_in = ms_to_dt(body.punch_in) if "punch_in" in sent else record.get("punch_in")
         new_out = ms_to_dt(body.punch_out) if "punch_out" in sent else record.get("punch_out")
         if new_in is None:
-            raise HTTPException(422, f"status {status} requires a punch_in")
+            raise validation_error(f"status {status} requires a punch_in",
+                                   "body", "punch_in")
         if "punch_in" in sent and attendance_date(
             new_in, emp["shift_start"], emp["shift_end"]
         ) != date:
-            raise HTTPException(422, "punch_in must stay on the record's attendance date")
+            raise validation_error("punch_in must stay on the record's attendance date",
+                                   "body", "punch_in")
         if new_out is not None:
             if new_out <= new_in:
-                raise HTTPException(422, "punch_out must be after punch_in")
+                raise validation_error("punch_out must be after punch_in",
+                                       "body", "punch_out")
             if new_out - new_in > timedelta(hours=24):
-                raise HTTPException(422, "punch_out must be within 24 hours of punch_in")
+                raise validation_error("punch_out must be within 24 hours of punch_in",
+                                       "body", "punch_out")
         work_hours = compute_work_hours(new_in, new_out) if new_out is not None else None
         final = {
             "status": status,
@@ -945,7 +989,7 @@ def regularize_attendance(
         if current[field] != final[field]
     }
     if not changes:
-        raise HTTPException(422, "the request would not change anything")
+        raise validation_error("the request would not change anything", "body")
 
     entry = {
         "at": now_utc(),
@@ -1086,7 +1130,7 @@ ExplainName = Literal[
 
 def require(value: Optional[str], name: str) -> str:
     if value is None:
-        raise HTTPException(422, f"{name} is required for this endpoint")
+        raise validation_error(f"{name} is required for this endpoint", "query", name)
     return value
 
 
