@@ -1,0 +1,21 @@
+# The submission is only: app/main.py, requirements.txt, README.md, REVIEW.md, DECISIONS.md.
+# The candidate kit itself is not republished (the problem statement asks for that).
+PROBLEM_STATEMENT.docx
+openapi.yaml
+DATA_MODEL.md
+sample_data/
+sample_seed.py
+
+# Local only: the test scripts used to verify this submission.
+tests/
+
+# Secrets, environments, caches
+.env
+.env.*
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.idea/
+.vscode/
