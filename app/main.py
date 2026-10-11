@@ -1012,7 +1012,8 @@ def department_summary(
         records = int(row.get("work_hours_records", 0) or 0)
         avg_work_hours = (
             None if records == 0
-            else report(Decimal(int(row["work_hours_centis"])) / (Decimal(100) * records))
+            # $round returns a double holding an exact integer; round() guards the cast.
+            else report(Decimal(round(row["work_hours_centis"])) / (Decimal(100) * records))
         )
         items.append({
             "department": row["_id"],
@@ -1141,8 +1142,11 @@ def explain_endpoint(
             trend_from = require(date_range_from, "from")
             trend_to = require(date_range_to, "to")
             validate_trend_range(trend_from, trend_to)
+            roster = department_roster(name)
+            if not roster:  # same 404 as the endpoint, and it keeps the plan real
+                raise HTTPException(404, "department not found")
             collection, pipeline, hint = build_department_trend_pipeline(
-                name, trend_from, trend_to, department_roster(name)
+                name, trend_from, trend_to, roster
             )
         command = {
             "aggregate": collection,
